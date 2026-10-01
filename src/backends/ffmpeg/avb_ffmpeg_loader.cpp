@@ -260,6 +260,8 @@ bool avb_ffmpeg_load(AvbFFmpegFuncs &out_funcs, char *err_buf, int err_buf_size)
     LOAD_SYM(g_handle_swscale, out_funcs, sws_getContext);
     LOAD_SYM(g_handle_swscale, out_funcs, sws_scale);
     LOAD_SYM(g_handle_swscale, out_funcs, sws_freeContext);
+    LOAD_SYM(g_handle_swscale, out_funcs, sws_setColorspaceDetails);
+    LOAD_SYM(g_handle_swscale, out_funcs, sws_getCoefficients);
 
     // Encoding / muxing
     LOAD_SYM(g_handle_avformat, out_funcs, avformat_alloc_output_context2);

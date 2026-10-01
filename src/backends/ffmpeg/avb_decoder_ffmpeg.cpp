@@ -192,6 +192,8 @@ void AvbDecoderFFmpeg::close_internal() {
     m_sws_src_w   = 0;
     m_sws_src_h   = 0;
     m_sws_src_fmt = AV_PIX_FMT_NONE;
+    m_sws_src_space = AVCOL_SPC_UNSPECIFIED;
+    m_sws_src_range = AVCOL_RANGE_UNSPECIFIED;
     m_hw_pix_fmt = AV_PIX_FMT_NONE;
     m_video_memory = AVB_VIDEO_MEMORY_CPU;
     m_video_external_type = AVB_VIDEO_EXTERNAL_NONE;
@@ -892,7 +894,10 @@ avb_result AvbDecoderFFmpeg::fill_cpu_video_frame(
     AVPixelFormat src_fmt = (AVPixelFormat)frame->format;
 
     // Rebuild swscale context if source properties changed
-    if (!m_sws || m_sws_src_w != w || m_sws_src_h != h || m_sws_src_fmt != src_fmt) {
+    const AVColorSpace src_space = frame->colorspace;
+    const AVColorRange src_range = frame->color_range;
+    if (!m_sws || m_sws_src_w != w || m_sws_src_h != h || m_sws_src_fmt != src_fmt ||
+        m_sws_src_space != src_space || m_sws_src_range != src_range) {
         if (m_sws) m_ff.sws_freeContext(m_sws);
         m_sws = m_ff.sws_getContext(
             w, h, src_fmt,
@@ -902,9 +907,31 @@ avb_result AvbDecoderFFmpeg::fill_cpu_video_frame(
             set_error("sws_getContext failed (unsupported pixel format?).");
             return AVB_ERROR_DECODE_FAILED;
         }
+        // swscale converts YUV with BT.601 limited-range coefficients unless
+        // told otherwise, which shifts every HD/UHD (BT.709) source's colours.
+        // Use what the stream declares, and the usual guess by size when it
+        // declares nothing. sws_getCoefficients takes AVColorSpace values.
+        int space = src_space;
+        if (space == AVCOL_SPC_UNSPECIFIED || space == AVCOL_SPC_RESERVED ||
+            space == AVCOL_SPC_RGB)
+            space = (w > 1024 || h >= 600) ? AVCOL_SPC_BT709
+                                           : AVCOL_SPC_SMPTE170M;
+        const int *coefficients = m_ff.sws_getCoefficients(space);
+        const int full_range = src_range == AVCOL_RANGE_JPEG ? 1 : 0;
+        // RGB output is always full range. YUV output keeps the source's
+        // range, which is what the frame reports below.
+        const bool rgb_out = m_dst_av_fmt == AV_PIX_FMT_RGBA ||
+                             m_dst_av_fmt == AV_PIX_FMT_BGRA;
+        // Fails only for RGB sources, which have no matrix to apply.
+        m_ff.sws_setColorspaceDetails(m_sws, coefficients, full_range,
+                                      coefficients,
+                                      rgb_out ? 1 : full_range,
+                                      0, 1 << 16, 1 << 16);
         m_sws_src_w   = w;
         m_sws_src_h   = h;
         m_sws_src_fmt = src_fmt;
+        m_sws_src_space = src_space;
+        m_sws_src_range = src_range;
     }
 
     // Lay out the destination buffer per output format. FFmpeg writes its own

@@ -83,6 +83,9 @@ struct AvbFFmpegFuncs {
     int (*sws_scale)(SwsContext *, const uint8_t *const [], const int [],
                      int, int, uint8_t *const [], const int []);
     void (*sws_freeContext)(SwsContext *);
+    int (*sws_setColorspaceDetails)(SwsContext *, const int [4], int,
+                                    const int [4], int, int, int, int);
+    const int *(*sws_getCoefficients)(int);
 
     // --- Encoding / muxing ---
     // avformat

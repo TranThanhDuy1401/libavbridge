@@ -86,6 +86,8 @@ private:
     int              m_sws_src_w      = 0;
     int              m_sws_src_h      = 0;
     AVPixelFormat    m_sws_src_fmt    = AV_PIX_FMT_NONE;
+    AVColorSpace     m_sws_src_space  = AVCOL_SPC_UNSPECIFIED;
+    AVColorRange     m_sws_src_range  = AVCOL_RANGE_UNSPECIFIED;
 
     // Requested output pixel format and its libav equivalent.
     avb_pixel_format m_video_format   = AVB_PIXEL_FORMAT_BGRA8;
