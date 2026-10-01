@@ -6,6 +6,7 @@
 #define NOMINMAX
 #endif
 
+#include <d3d10.h> // ID3D10Multithread, which D3D11 devices also expose
 #include <mfapi.h>
 #include <mferror.h>
 #include <windows.h>
@@ -39,6 +40,13 @@ HRESULT mf_create_d3d11_device_manager(
             D3D11_SDK_VERSION, &created_device, &feature_level, nullptr);
         if (FAILED(hr)) return hr;
     }
+
+    // Media Foundation drives the device from its own worker threads while the
+    // caller reads frames back on another, which D3D11 only allows on a device
+    // that serializes its immediate context.
+    ComPtr<ID3D10Multithread> multithread;
+    if (SUCCEEDED(created_device.As(&multithread)))
+        multithread->SetMultithreadProtected(TRUE);
 
     ComPtr<IMFDXGIDeviceManager> created_manager;
     UINT reset_token = 0;

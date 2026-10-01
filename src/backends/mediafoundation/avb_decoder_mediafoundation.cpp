@@ -52,6 +52,13 @@ struct AvbDecoderMediaFoundation::Impl {
     bool ivf_draining = false;
     bool ivf_native_output = false;
     bool source_native_output = false;
+    // CPU frames from a hardware decoder: the Source Reader decodes on the GPU
+    // and each NV12 surface is copied back through a staging texture. The
+    // software decoder is several times slower at UHD, and its RGB conversion
+    // slower still.
+    bool source_cpu_readback = false;
+    ComPtr<ID3D11Texture2D> readback_staging;
+    D3D11_TEXTURE2D_DESC readback_desc{};
     uint32_t ivf_frame_count = 0;
     uint32_t ivf_frame_index = 0;
     uint32_t ivf_rate = 0;
@@ -72,6 +79,9 @@ struct AvbDecoderMediaFoundation::Impl {
     int height       = 0;
     int video_stride = 0;        // bytes per row; may exceed width*4 due to alignment
     bool video_bottom_up = false; // true when MF_MT_DEFAULT_STRIDE is negative
+    int video_buffer_height = 0; // padded rows before a planar chroma plane
+    avb_color_matrix video_color_matrix = AVB_COLOR_MATRIX_UNKNOWN;
+    avb_color_range video_color_range = AVB_COLOR_RANGE_UNKNOWN;
 
     avb_pixel_format video_avb_fmt = AVB_PIXEL_FORMAT_BGRA8;
     bool swizzle_rgba = false;    // request ARGB32 (BGRA), emit RGBA
@@ -114,6 +124,84 @@ struct AvbDecoderMediaFoundation::Impl {
         return key;
     }
 
+    // Copy a hardware-decoded NV12 surface into `out` as tightly packed NV12
+    // (Y rows, then interleaved CbCr rows) of width x height. Returns
+    // AVB_ERROR_STREAM_NOT_FOUND when the sample is not a GPU surface -- the
+    // reader fell back to a software decoder -- so the caller copies it the
+    // ordinary way.
+    avb_result readback_nv12(IMFSample *sample, int width, int height,
+                             std::vector<unsigned char> &out) {
+        ComPtr<IMFMediaBuffer> raw;
+        ComPtr<IMFDXGIBuffer> dxgi_buffer;
+        if (FAILED(sample->GetBufferByIndex(0, &raw)) || !raw ||
+            FAILED(raw.As(&dxgi_buffer)) || !dxgi_buffer)
+            return AVB_ERROR_STREAM_NOT_FOUND;
+
+        ComPtr<ID3D11Texture2D> texture;
+        UINT subresource = 0;
+        if (FAILED(dxgi_buffer->GetResource(
+                __uuidof(ID3D11Texture2D),
+                reinterpret_cast<void **>(texture.GetAddressOf()))) ||
+            !texture ||
+            FAILED(dxgi_buffer->GetSubresourceIndex(&subresource)))
+            return AVB_ERROR_DECODE_FAILED;
+
+        D3D11_TEXTURE2D_DESC desc{};
+        texture->GetDesc(&desc);
+        if (desc.Format != DXGI_FORMAT_NV12 ||
+            desc.Width < static_cast<UINT>(width) ||
+            desc.Height < static_cast<UINT>(height))
+            return AVB_ERROR_DECODE_FAILED;
+
+        ComPtr<ID3D11Device> device;
+        texture->GetDevice(&device);
+        ComPtr<ID3D11DeviceContext> context;
+        device->GetImmediateContext(&context);
+
+        // One staging surface, kept: its shape only changes with the stream's.
+        if (!readback_staging || readback_desc.Width != desc.Width ||
+            readback_desc.Height != desc.Height) {
+            D3D11_TEXTURE2D_DESC staging = desc;
+            staging.MipLevels = 1;
+            staging.ArraySize = 1;
+            staging.BindFlags = 0;
+            staging.MiscFlags = 0;
+            staging.Usage = D3D11_USAGE_STAGING;
+            staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            readback_staging.Reset();
+            if (FAILED(device->CreateTexture2D(&staging, nullptr,
+                                               &readback_staging)))
+                return AVB_ERROR_DECODE_FAILED;
+            readback_desc = staging;
+        }
+
+        context->CopySubresourceRegion(readback_staging.Get(), 0, 0, 0, 0,
+                                       texture.Get(), subresource, nullptr);
+        // Waits for the decode and the copy -- which is the frame being ready.
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (FAILED(context->Map(readback_staging.Get(), 0, D3D11_MAP_READ, 0,
+                                &mapped)))
+            return AVB_ERROR_DECODE_FAILED;
+
+        const size_t chroma_row = static_cast<size_t>((width + 1) / 2) * 2;
+        const int chroma_rows = (height + 1) / 2;
+        const size_t y_size = static_cast<size_t>(width) * height;
+        out.resize(y_size + chroma_row * chroma_rows);
+        const auto *source = static_cast<const unsigned char *>(mapped.pData);
+        for (int row = 0; row < height; ++row)
+            memcpy(out.data() + static_cast<size_t>(row) * width,
+                   source + static_cast<size_t>(row) * mapped.RowPitch, width);
+        // The chroma plane follows the full (padded) surface height.
+        const unsigned char *chroma =
+            source + static_cast<size_t>(mapped.RowPitch) * desc.Height;
+        for (int row = 0; row < chroma_rows; ++row)
+            memcpy(out.data() + y_size + row * chroma_row,
+                   chroma + static_cast<size_t>(row) * mapped.RowPitch,
+                   chroma_row);
+        context->Unmap(readback_staging.Get(), 0);
+        return AVB_OK;
+    }
+
     void close_streams() {
         if (custom_video_decoder && custom_video_decoder->close && custom_video_ctx)
             custom_video_decoder->close(custom_video_ctx);
@@ -136,6 +224,12 @@ struct AvbDecoderMediaFoundation::Impl {
         ivf_draining = false;
         ivf_native_output = false;
         source_native_output = false;
+        source_cpu_readback = false;
+        readback_staging.Reset();
+        readback_desc = {};
+        video_buffer_height = 0;
+        video_color_matrix = AVB_COLOR_MATRIX_UNKNOWN;
+        video_color_range = AVB_COLOR_RANGE_UNKNOWN;
         ivf_frame_count = 0;
         ivf_frame_index = 0;
         ivf_rate = 0;
@@ -344,11 +438,37 @@ avb_result AvbDecoderMediaFoundation::open_file(const char *path, const avb_deco
     std::wstring wpath(wlen, L'\0');
     MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath.data(), wlen);
 
+    // CPU NV12 with hardware allowed: decode on the GPU and read the surfaces
+    // back. Only NV12, which is what the decoders produce -- any other CPU
+    // format would need the GPU video processor's output read back instead,
+    // which is more bytes for a conversion the caller can do better.
+    const bool cpu_readback =
+        !native_d3d11 && options.enable_video &&
+        options.video_memory == AVB_VIDEO_MEMORY_CPU &&
+        options.hardware_policy != AVB_HARDWARE_DISABLED &&
+        options.video_format == AVB_PIXEL_FORMAT_NV12 &&
+        (options.hardware_device == AVB_HW_DEVICE_AUTO ||
+         options.hardware_device == AVB_HW_DEVICE_D3D11VA);
+
     ComPtr<IMFAttributes> attrs;
-    MFCreateAttributes(&attrs, native_d3d11 ? 4 : 1);
+    MFCreateAttributes(&attrs, (native_d3d11 || cpu_readback) ? 4 : 1);
     // Enables the Video Processor MFT so any codec can be converted to the
     // requested output format regardless of what the decoder natively outputs.
     attrs->SetUINT32(MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, TRUE);
+    if (cpu_readback) {
+        // Best effort: without a device the reader simply decodes in software,
+        // which is what this open would have done anyway.
+        if (SUCCEEDED(mf_create_d3d11_device_manager(
+                static_cast<ID3D11Device *>(options.hardware_context),
+                &m_impl->ivf_d3d_device, &m_impl->ivf_device_manager)) &&
+            SUCCEEDED(attrs->SetUINT32(
+                MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE)) &&
+            SUCCEEDED(attrs->SetUnknown(
+                MF_SOURCE_READER_D3D_MANAGER,
+                m_impl->ivf_device_manager.Get()))) {
+            m_impl->source_cpu_readback = true;
+        }
+    }
     if (native_d3d11) {
         HRESULT manager_hr = mf_create_d3d11_device_manager(
             static_cast<ID3D11Device *>(options.hardware_context),
@@ -453,6 +573,9 @@ avb_result AvbDecoderMediaFoundation::open_file(const char *path, const avb_deco
             m_impl->height = video_format.height;
             m_impl->video_stride = video_format.stride;
             m_impl->video_bottom_up = video_format.bottom_up;
+            m_impl->video_buffer_height = video_format.buffer_height;
+            m_impl->video_color_matrix = video_format.color_matrix;
+            m_impl->video_color_range = video_format.color_range;
             m_impl->frame_rate = video_format.frame_rate;
             m_impl->video_codec_name = native_video_codec;
         }
@@ -958,7 +1081,10 @@ avb_result AvbDecoderMediaFoundation::read_video_frame(avb_video_frame &out_fram
                 m_impl->height,
                 m_impl->video_stride,
                 m_impl->video_bottom_up,
-                m_impl->frame_rate};
+                m_impl->frame_rate,
+                m_impl->video_buffer_height,
+                m_impl->video_color_matrix,
+                m_impl->video_color_range};
             hr = mf_decode_refresh_video_format(
                 m_impl->reader.Get(), (DWORD)m_impl->video_stream_idx,
                 m_impl->source_native_output, &video_format);
@@ -974,6 +1100,9 @@ avb_result AvbDecoderMediaFoundation::read_video_frame(avb_video_frame &out_fram
             m_impl->height = video_format.height;
             m_impl->video_stride = video_format.stride;
             m_impl->video_bottom_up = video_format.bottom_up;
+            m_impl->video_buffer_height = video_format.buffer_height;
+            m_impl->video_color_matrix = video_format.color_matrix;
+            m_impl->video_color_range = video_format.color_range;
         }
         if (!sample) {
             if (m_impl->video_seek_pending ||
@@ -1069,20 +1198,63 @@ avb_result AvbDecoderMediaFoundation::read_video_frame(avb_video_frame &out_fram
         out_frame.native_handle_id = subresource;
         out_frame.native_owner =
             m_impl->retain_native_frame(sample.Get(), texture.Get());
+        out_frame.color_matrix = m_impl->video_color_matrix;
+        out_frame.color_range = m_impl->video_color_range;
         for (int p = 0; p < AVB_MAX_PLANES; ++p) out_frame.dmabuf_fd[p] = -1;
         return AVB_OK;
     }
 
-    return mf_decode_copy_cpu_frame(
-        sample.Get(),
-        w,
-        h,
-        m_impl->video_stride,
-        m_impl->video_bottom_up,
-        m_impl->video_avb_fmt,
-        static_cast<double>(ts) / 1e7,
-        m_impl->video_frame_buf,
-        out_frame);
+    const double pts_sec = static_cast<double>(ts) / 1e7;
+    avb_result res = AVB_ERROR_STREAM_NOT_FOUND;
+    if (m_impl->source_cpu_readback && m_impl->video_is_nv12) {
+        res = m_impl->readback_nv12(sample.Get(), w, h, m_impl->video_frame_buf);
+        if (res == AVB_OK) {
+            const size_t y_size = static_cast<size_t>(w) * h;
+            const int chroma_row = (w + 1) / 2 * 2;
+            out_frame = {};
+            out_frame.width = w;
+            out_frame.height = h;
+            out_frame.format = AVB_PIXEL_FORMAT_NV12;
+            out_frame.pts_sec = pts_sec;
+            out_frame.memory_type = AVB_VIDEO_MEMORY_CPU;
+            out_frame.hardware_device = AVB_HW_DEVICE_D3D11VA;
+            for (int p = 0; p < AVB_MAX_PLANES; ++p) out_frame.dmabuf_fd[p] = -1;
+            out_frame.plane_count = 2;
+            out_frame.plane_data[0] = m_impl->video_frame_buf.data();
+            out_frame.plane_stride[0] = w;
+            out_frame.plane_offset[0] = 0;
+            out_frame.plane_data[1] = m_impl->video_frame_buf.data() + y_size;
+            out_frame.plane_stride[1] = chroma_row;
+            out_frame.plane_offset[1] = static_cast<int>(y_size);
+            out_frame.data = out_frame.plane_data[0];
+            out_frame.stride = out_frame.plane_stride[0];
+            out_frame.data_size =
+                static_cast<int>(m_impl->video_frame_buf.size());
+        } else if (res != AVB_ERROR_STREAM_NOT_FOUND) {
+            m_last_error = "Reading back a hardware-decoded frame failed.";
+            return res;
+        }
+    }
+    // Not a GPU surface (software decode, or a format the readback does not
+    // cover): copy it out of system memory.
+    if (res == AVB_ERROR_STREAM_NOT_FOUND) {
+        res = mf_decode_copy_cpu_frame(
+            sample.Get(),
+            w,
+            h,
+            m_impl->video_buffer_height > 0 ? m_impl->video_buffer_height : h,
+            m_impl->video_stride,
+            m_impl->video_bottom_up,
+            m_impl->video_avb_fmt,
+            pts_sec,
+            m_impl->video_frame_buf,
+            out_frame);
+    }
+    if (res == AVB_OK) {
+        out_frame.color_matrix = m_impl->video_color_matrix;
+        out_frame.color_range = m_impl->video_color_range;
+    }
+    return res;
 }
 
 void AvbDecoderMediaFoundation::release_video_frame(avb_video_frame &frame) {

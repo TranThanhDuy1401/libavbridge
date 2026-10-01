@@ -31,11 +31,19 @@ HRESULT mf_decode_configure_audio(
 
 struct MfDecodeVideoFormat {
     avb_pixel_format pixel_format;
+    // The picture: the display aperture when the type has one, which is what
+    // a decoder that pads its surfaces (1080 coded as 1088) reports it as.
     int width;
     int height;
     int stride;
     bool bottom_up;
     double frame_rate;
+    // Rows in the buffer before the chroma plane starts: the padded height.
+    // Equal to height when the type has no smaller aperture.
+    int buffer_height;
+    // The YUV encoding the stream declares; UNKNOWN when it declares nothing.
+    avb_color_matrix color_matrix;
+    avb_color_range color_range;
 };
 
 HRESULT mf_decode_configure_video(

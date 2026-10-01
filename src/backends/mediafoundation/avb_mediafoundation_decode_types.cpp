@@ -205,6 +205,57 @@ HRESULT mf_decode_refresh_video_format(
         return FAILED(hr) ? hr : E_FAIL;
     format->width = static_cast<int>(width);
     format->height = static_cast<int>(height);
+    format->buffer_height = static_cast<int>(height);
+
+    // A decoder that codes in macroblocks hands out padded surfaces (1080p as
+    // 1088 rows) and says where the picture is with an aperture. The rows
+    // below it are not part of the picture.
+    MFVideoArea aperture{};
+    UINT32 aperture_size = 0;
+    if (SUCCEEDED(current->GetBlob(
+            MF_MT_MINIMUM_DISPLAY_APERTURE,
+            reinterpret_cast<UINT8 *>(&aperture), sizeof(aperture),
+            &aperture_size)) &&
+        aperture_size == sizeof(aperture) && aperture.Area.cx > 0 &&
+        aperture.Area.cy > 0 &&
+        aperture.Area.cx <= static_cast<LONG>(width) &&
+        aperture.Area.cy <= static_cast<LONG>(height)) {
+        format->width = static_cast<int>(aperture.Area.cx);
+        format->height = static_cast<int>(aperture.Area.cy);
+    }
+
+    // What the stream says about its YUV encoding. The output type carries it
+    // when the decoder passed it on; the container's type is the fallback.
+    format->color_matrix = AVB_COLOR_MATRIX_UNKNOWN;
+    format->color_range = AVB_COLOR_RANGE_UNKNOWN;
+    ComPtr<IMFMediaType> native;
+    reader->GetNativeMediaType(stream, 0, &native);
+    for (IMFMediaType *type : {current.Get(), native.Get()}) {
+        if (!type) continue;
+        UINT32 matrix = 0;
+        if (format->color_matrix == AVB_COLOR_MATRIX_UNKNOWN &&
+            SUCCEEDED(type->GetUINT32(MF_MT_YUV_MATRIX, &matrix))) {
+            switch (matrix) {
+            case MFVideoTransferMatrix_BT709:
+                format->color_matrix = AVB_COLOR_MATRIX_BT709; break;
+            case MFVideoTransferMatrix_BT601:
+            case MFVideoTransferMatrix_SMPTE240M:
+                format->color_matrix = AVB_COLOR_MATRIX_BT601; break;
+            case MFVideoTransferMatrix_BT2020_10:
+            case MFVideoTransferMatrix_BT2020_12:
+                format->color_matrix = AVB_COLOR_MATRIX_BT2020_NCL; break;
+            default: break;
+            }
+        }
+        UINT32 range = 0;
+        if (format->color_range == AVB_COLOR_RANGE_UNKNOWN &&
+            SUCCEEDED(type->GetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, &range))) {
+            if (range == MFNominalRange_0_255)
+                format->color_range = AVB_COLOR_RANGE_FULL;
+            else if (range == MFNominalRange_16_235)
+                format->color_range = AVB_COLOR_RANGE_LIMITED;
+        }
+    }
 
     UINT32 numerator = 0;
     UINT32 denominator = 1;

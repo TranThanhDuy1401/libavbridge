@@ -31,6 +31,7 @@ bool copy_nv12(
     IMFSample *sample,
     int width,
     int height,
+    int buffer_height,
     int source_stride,
     unsigned char *output) {
     const int chroma_rows = height / 2;
@@ -49,7 +50,7 @@ bool copy_nv12(
             LONG pitch = 0;
             if (SUCCEEDED(buffer2d->Lock2D(&scan0, &pitch))) {
                 const BYTE *chroma =
-                    scan0 + static_cast<ptrdiff_t>(pitch) * height;
+                    scan0 + static_cast<ptrdiff_t>(pitch) * buffer_height;
                 for (int row = 0; row < height; ++row) {
                     std::memcpy(
                         output + static_cast<std::size_t>(row) * width,
@@ -77,7 +78,7 @@ bool copy_nv12(
     if (FAILED(buffer->Lock(&data, nullptr, nullptr))) return false;
     const int stride = source_stride > 0 ? source_stride : width;
     const BYTE *chroma =
-        data + static_cast<std::size_t>(stride) * height;
+        data + static_cast<std::size_t>(stride) * buffer_height;
     for (int row = 0; row < height; ++row) {
         std::memcpy(
             output + static_cast<std::size_t>(row) * width,
@@ -98,6 +99,7 @@ bool copy_i420(
     IMFSample *sample,
     int width,
     int height,
+    int buffer_height,
     int source_stride,
     unsigned char *output) {
     const int chroma_width = width / 2;
@@ -112,10 +114,10 @@ bool copy_i420(
     auto copy_planes = [&](const BYTE *source_y, int y_pitch) {
         const int chroma_pitch = y_pitch / 2;
         const BYTE *source_u =
-            source_y + static_cast<ptrdiff_t>(y_pitch) * height;
+            source_y + static_cast<ptrdiff_t>(y_pitch) * buffer_height;
         const BYTE *source_v =
             source_u +
-            static_cast<ptrdiff_t>(chroma_pitch) * chroma_height;
+            static_cast<ptrdiff_t>(chroma_pitch) * (buffer_height / 2);
         for (int row = 0; row < height; ++row) {
             std::memcpy(
                 output + static_cast<std::size_t>(row) * width,
@@ -223,6 +225,7 @@ avb_result mf_decode_copy_cpu_frame(
     IMFSample *sample,
     int width,
     int height,
+    int buffer_height,
     int source_stride,
     bool bottom_up,
     avb_pixel_format output_format,
@@ -236,7 +239,8 @@ avb_result mf_decode_copy_cpu_frame(
             static_cast<std::size_t>(width) * height;
         storage.resize(y_size + y_size / 2);
         if (!copy_nv12(
-                sample, width, height, source_stride, storage.data())) {
+                sample, width, height, buffer_height, source_stride,
+                storage.data())) {
             return AVB_ERROR_DECODE_FAILED;
         }
 
@@ -258,7 +262,8 @@ avb_result mf_decode_copy_cpu_frame(
             static_cast<std::size_t>(chroma_width) * chroma_height;
         storage.resize(y_size + 2 * chroma_size);
         if (!copy_i420(
-                sample, width, height, source_stride, storage.data())) {
+                sample, width, height, buffer_height, source_stride,
+                storage.data())) {
             return AVB_ERROR_DECODE_FAILED;
         }
 
