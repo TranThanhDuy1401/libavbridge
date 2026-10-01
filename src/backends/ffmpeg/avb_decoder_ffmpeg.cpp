@@ -80,50 +80,130 @@ void AvbDecoderFFmpeg::set_ff_error(const char *prefix, int errnum) {
     set_error("%s: %s", prefix, errbuf);
 }
 
+// How far the reader runs ahead of the decoder. Enough for a few frames of a
+// 4K intra-only stream (Hap Q is ~8 MB a frame) -- one is what overlaps the
+// read with the decode, the rest absorb a slow read -- while the count keeps a
+// stream of tiny packets from queueing seconds of input.
+static constexpr size_t kReadAheadBytes = 32u * 1024u * 1024u;
+static constexpr size_t kReadAheadPackets = 128;
+
 void AvbDecoderFFmpeg::clear_packet_queues() {
     for (AVPacket *p : m_audio_pkts) m_ff.av_packet_free(&p);
     for (AVPacket *p : m_video_pkts) m_ff.av_packet_free(&p);
     m_audio_pkts.clear();
     m_video_pkts.clear();
+    m_queued_bytes = 0;
+    m_queued_count = 0;
+}
+
+AVPacket *AvbDecoderFFmpeg::route_packet(int want_idx) {
+    const int sidx = m_packet->stream_index;
+    std::deque<AVPacket *> *queue = nullptr;
+    if (sidx == m_audio_stream_idx && m_audio_codec_ctx)
+        queue = &m_audio_pkts;
+    else if (sidx == m_video_stream_idx &&
+             (m_video_codec_ctx || m_custom_video_decoder))
+        queue = &m_video_pkts;
+    if (!queue) {
+        // Not a stream anyone decodes.
+        m_ff.av_packet_unref(m_packet);
+        return nullptr;
+    }
+
+    AVPacket *p = m_ff.av_packet_alloc();
+    m_ff.av_packet_move_ref(p, m_packet);
+    if (sidx == want_idx) return p;
+    queue->push_back(p);
+    m_queued_bytes += (size_t)p->size;
+    ++m_queued_count;
+    return nullptr;
 }
 
 AVPacket *AvbDecoderFFmpeg::demux_next(int stream_idx) {
     std::deque<AVPacket *> &want_q =
         (stream_idx == m_audio_stream_idx) ? m_audio_pkts : m_video_pkts;
-    if (!want_q.empty()) {
+
+    auto pop = [&]() {
         AVPacket *p = want_q.front();
         want_q.pop_front();
+        m_queued_bytes -= (size_t)p->size;
+        --m_queued_count;
+        return p;
+    };
+
+    if (m_read_ahead) {
+        std::unique_lock<std::mutex> lock(m_pkt_mutex);
+        if (want_q.empty() && !m_reader_eof) {
+            ++m_reader_waiters;
+            m_room_cv.notify_one();
+            m_pkt_cv.wait(lock, [&] { return !want_q.empty() || m_reader_eof; });
+            --m_reader_waiters;
+        }
+        if (want_q.empty()) return nullptr; // EOF or read error
+        AVPacket *p = pop();
+        m_room_cv.notify_one();
         return p;
     }
+
+    if (!want_q.empty()) return pop();
 
     while (true) {
         int ret = m_ff.av_read_frame(m_fmt_ctx, m_packet);
         if (ret < 0) return nullptr; // EOF or read error
+        // Packets for the other enabled stream are queued, not discarded.
+        if (AVPacket *p = route_packet(stream_idx)) return p;
+    }
+}
 
-        int sidx = m_packet->stream_index;
-        if (sidx == stream_idx) {
-            AVPacket *p = m_ff.av_packet_alloc();
-            m_ff.av_packet_move_ref(p, m_packet);
-            return p;
+void AvbDecoderFFmpeg::start_reader() {
+    if (!m_read_ahead || m_reader.joinable()) return;
+    m_reader_stop = false;
+    m_reader_eof = false;
+    m_reader = std::thread([this] { reader_loop(); });
+}
+
+void AvbDecoderFFmpeg::stop_reader() {
+    if (!m_reader.joinable()) return;
+    {
+        std::lock_guard<std::mutex> lock(m_pkt_mutex);
+        m_reader_stop = true;
+    }
+    m_room_cv.notify_all();
+    m_reader.join();
+}
+
+void AvbDecoderFFmpeg::reader_loop() {
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lock(m_pkt_mutex);
+            m_room_cv.wait(lock, [&] {
+                return m_reader_stop || m_reader_waiters > 0 ||
+                       (m_queued_bytes < kReadAheadBytes &&
+                        m_queued_count < kReadAheadPackets);
+            });
+            if (m_reader_stop) return;
         }
 
-        // Queue packets for the other enabled stream; discard everything else.
-        if (sidx == m_audio_stream_idx && m_audio_codec_ctx) {
-            AVPacket *p = m_ff.av_packet_alloc();
-            m_ff.av_packet_move_ref(p, m_packet);
-            m_audio_pkts.push_back(p);
-        } else if (sidx == m_video_stream_idx &&
-                   (m_video_codec_ctx || m_custom_video_decoder)) {
-            AVPacket *p = m_ff.av_packet_alloc();
-            m_ff.av_packet_move_ref(p, m_packet);
-            m_video_pkts.push_back(p);
-        } else {
-            m_ff.av_packet_unref(m_packet);
+        // The read itself runs unlocked: it is the slow part, and the decoder
+        // keeps taking queued packets meanwhile.
+        const int ret = m_ff.av_read_frame(m_fmt_ctx, m_packet);
+
+        std::lock_guard<std::mutex> lock(m_pkt_mutex);
+        if (ret < 0) {
+            // EOF or read error; the synchronous path treats both as the end.
+            m_reader_eof = true;
+            m_pkt_cv.notify_all();
+            return;
         }
+        route_packet(-1);
+        m_pkt_cv.notify_all();
     }
 }
 
 void AvbDecoderFFmpeg::close_internal() {
+    // First: the reader uses m_fmt_ctx and m_packet, which go below.
+    stop_reader();
+    m_read_ahead = false;
     if (m_sws) {
         m_ff.sws_freeContext(m_sws);
         m_sws = nullptr;
@@ -233,7 +313,12 @@ avb_result AvbDecoderFFmpeg::open_file(const char *path, const avb_decode_option
         set_ff_error("avformat_open_input failed", ret);
         return AVB_ERROR_OPEN_FAILED;
     }
-    return setup_after_open(options);
+    avb_result res = setup_after_open(options);
+    if (res == AVB_OK) {
+        m_read_ahead = true;
+        start_reader();
+    }
+    return res;
 }
 
 avb_result AvbDecoderFFmpeg::open_io(const avb_io_callbacks &cb, void *user,
@@ -637,10 +722,14 @@ avb_result AvbDecoderFFmpeg::get_media_info(avb_media_info &out_info) {
 avb_result AvbDecoderFFmpeg::seek(double seconds) {
     if (!m_fmt_ctx) return AVB_ERROR_INVALID_ARGUMENT;
 
+    // The reader is mid-file; it has to stand still while the position moves,
+    // and whatever it queued belongs to the old position.
+    stop_reader();
     int64_t ts = (int64_t)(seconds * AV_TIME_BASE);
     int ret = m_ff.av_seek_frame(m_fmt_ctx, -1, ts, AVSEEK_FLAG_BACKWARD);
     if (ret < 0) {
         set_ff_error("av_seek_frame failed", ret);
+        start_reader();
         return AVB_ERROR_SEEK_FAILED;
     }
 
@@ -654,6 +743,7 @@ avb_result AvbDecoderFFmpeg::seek(double seconds) {
     m_eof = false;
     m_seek_target = seconds;
     m_audio_seek_target = seconds;
+    start_reader();
     return AVB_OK;
 }
 

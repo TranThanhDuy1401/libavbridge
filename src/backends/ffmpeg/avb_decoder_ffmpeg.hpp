@@ -4,8 +4,11 @@
 #include "avb_decoder_impl.hpp"
 #include "avb_ffmpeg_loader.hpp"
 
+#include <condition_variable>
 #include <deque>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 class AvbDecoderFFmpeg : public AvbDecoderImpl {
@@ -43,6 +46,20 @@ private:
     // or nullptr at end of file.
     AVPacket *demux_next(int stream_idx);
     void clear_packet_queues();
+    // Queue a packet just read for whichever enabled stream it belongs to, or
+    // drop it. Returns the packet when it is for `want_idx` instead of queueing
+    // it (pass -1 to queue everything). Callers serialize access to the queues.
+    AVPacket *route_packet(int want_idx);
+
+    // Read-ahead: a thread that keeps demuxing while the caller decodes, so
+    // reading a packet (megabytes per frame for intra-only codecs such as HAP)
+    // overlaps decoding the previous one instead of adding to it. Only for
+    // files opened by path -- custom I/O callbacks stay on the caller's thread.
+    // The thread owns m_fmt_ctx reads and m_packet while it runs; seek and
+    // close stop it first.
+    void start_reader();
+    void stop_reader();
+    void reader_loop();
     avb_result open_custom_video_decoder(AVStream *st,
                                          const avb_decode_options &options);
     avb_result read_custom_video_frame(avb_video_frame &out_frame);
@@ -102,6 +119,20 @@ private:
     // by demux_next() when a packet for the other stream is encountered.
     std::deque<AVPacket *>     m_audio_pkts;
     std::deque<AVPacket *>     m_video_pkts;
+
+    // Read-ahead state, guarded by m_pkt_mutex along with the queues above.
+    bool                       m_read_ahead = false;  // enabled for this open
+    std::thread                m_reader;
+    std::mutex                 m_pkt_mutex;
+    std::condition_variable    m_pkt_cv;    // a packet arrived, or input ended
+    std::condition_variable    m_room_cv;   // room freed, a caller waits, or stop
+    bool                       m_reader_stop = false;
+    bool                       m_reader_eof  = false;
+    // A caller is blocked on an empty queue: read on past the limits until its
+    // packet turns up, exactly as the synchronous path would.
+    int                        m_reader_waiters = 0;
+    size_t                     m_queued_bytes   = 0;
+    size_t                     m_queued_count   = 0;
 
     // Custom-I/O state (avb_decoder_open_io / open_memory). m_avio is non-null
     // only when decoding through callbacks rather than a file path.
