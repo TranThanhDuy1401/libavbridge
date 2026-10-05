@@ -514,7 +514,7 @@ avb_result AvbDecoderMediaFoundation::open_file(const char *path, const avb_deco
 
     if (!options.enable_audio) found_audio = -1;
     if (!options.enable_video) found_video = -1;
-    if (options.audio_stream_index > 0) found_audio = options.audio_stream_index;
+    if (options.audio_stream_index >= 0) found_audio = options.audio_stream_index;
     if (options.video_stream_index >= 0) found_video = options.video_stream_index;
 
     m_impl->reader->SetStreamSelection((DWORD)MF_SOURCE_READER_ALL_STREAMS, FALSE);
